@@ -10,6 +10,7 @@ import (
 type Selection struct {
 	Client    client
 	selectors []types.Selector
+	acceptAll bool
 }
 
 type client interface {
@@ -18,108 +19,34 @@ type client interface {
 	retriever
 }
 
-type retriever interface {
-	GetElements(selector types.Selector) ([]types.Element, error)
-}
-
-func getElements(retriever retriever, selector types.Selector) ([]types.Element, error) {
-	elements, err := retriever.GetElements(selector)
-	if err != nil {
-		return nil, err
-	}
-
-	if selector.Indexed {
-		if selector.Index >= len(elements) {
-			return nil, fmt.Errorf("element index out of range (>%d)", len(elements)-1)
-		}
-
-		elements = []types.Element{elements[selector.Index]}
-	}
-
-	return elements, nil
-}
-
-func (s *Selection) getElements() ([]types.Element, error) {
-	if len(s.selectors) == 0 {
-		return nil, errors.New("empty selection")
-	}
-
-	lastElements, err := getElements(s.Client, s.selectors[0])
-	if err != nil {
-		return nil, err
-	}
-
-	for _, selector := range s.selectors[1:] {
-		elements := []types.Element{}
-		for _, element := range lastElements {
-			subElements, err := getElements(element, selector)
-			if err != nil {
-				return nil, err
-			}
-
-			elements = append(elements, subElements...)
-		}
-		lastElements = elements
-	}
-	return lastElements, nil
-}
-
-func (s *Selection) getSelectedElement() (types.Element, error) {
-	elements, err := s.getElements()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(elements) == 0 {
-		return nil, fmt.Errorf("no element found")
-	}
-
-	if len(elements) > 1 {
-		return nil, fmt.Errorf("multiple elements (%d) were selected", len(elements))
-	}
-
-	return elements[0], nil
-}
-
 func (s *Selection) At(index int) types.Selection {
 	last := len(s.selectors) - 1
 
-	if last != -1 {
-		newSelector := s.selectors[last]
-		newSelector.Index = index
-		newSelector.Indexed = true
-		return &Selection{s.Client, appendSelector(s.selectors[:last], newSelector)}
+	if last < 0 {
+		return &Selection{s.Client, newSelectors(s.selectors), s.acceptAll}
 	}
 
-	return &Selection{s.Client, s.selectors}
-}
-
-func appendSelector(selectors []types.Selector, selector types.Selector) []types.Selector {
-	selectorsCopy := append([]types.Selector(nil), selectors...)
-	return append(selectorsCopy, selector)
+	newSelector := s.selectors[last]
+	newSelector.Index = index
+	newSelector.Indexed = true
+	return &Selection{s.Client, newSelectors(s.selectors[:last], newSelector), s.acceptAll}
 }
 
 func (s *Selection) Find(selector string) types.Selection {
 	last := len(s.selectors) - 1
-
-	if last == -1 || s.selectors[last].Using != "css selector" || s.selectors[last].Indexed {
-		newSelector := types.Selector{Using: "css selector", Value: selector}
-		return &Selection{s.Client, appendSelector(s.selectors, newSelector)}
+	if last >= 0 && s.selectors[last].Using == "css selector" && !s.selectors[last].Indexed {
+		return s.mergedSelection(selector)
 	}
 
-	newSelectorValue := s.selectors[last].Value + " " + selector
-	newSelector := types.Selector{Using: "css selector", Value: newSelectorValue}
-	return &Selection{s.Client, appendSelector(s.selectors[:last], newSelector)}
+	return s.subSelection("css selector", selector)
 }
 
 func (s *Selection) FindXPath(selector string) types.Selection {
-	newSelector := types.Selector{Using: "xpath", Value: selector}
-	return &Selection{s.Client, appendSelector(s.selectors, newSelector)}
+	return s.subSelection("xpath", selector)
 }
 
 func (s *Selection) FindLink(text string) types.Selection {
-	newSelector := types.Selector{Using: "link text", Value: text}
-	return &Selection{s.Client, appendSelector(s.selectors, newSelector)}
+	return s.subSelection("link text", text)
 }
 
 func (s *Selection) FindByLabel(text string) types.Selection {
@@ -127,8 +54,25 @@ func (s *Selection) FindByLabel(text string) types.Selection {
 	return s.FindXPath(selector)
 }
 
-func (s *Selection) All() types.MultiSelection {
-	return &MultiSelection{s}
+func (s *Selection) All() types.Selection {
+	return &Selection{s.Client, newSelectors(s.selectors), true}
+}
+
+func (s *Selection) subSelection(using, value string) *Selection {
+	newSelector := types.Selector{Using: using, Value: value}
+	return &Selection{s.Client, newSelectors(s.selectors, newSelector), s.acceptAll}
+}
+
+func (s *Selection) mergedSelection(value string) *Selection {
+	last := len(s.selectors) - 1
+	newSelectorValue := s.selectors[last].Value + " " + value
+	newSelector := types.Selector{Using: "css selector", Value: newSelectorValue}
+	return &Selection{s.Client, newSelectors(s.selectors[:last], newSelector), s.acceptAll}
+}
+
+func newSelectors(selectors []types.Selector, newSelectors ...types.Selector) []types.Selector {
+	selectorsCopy := append([]types.Selector(nil), selectors...)
+	return append(selectorsCopy, newSelectors...)
 }
 
 func (s *Selection) String() string {
@@ -138,13 +82,18 @@ func (s *Selection) String() string {
 		tags = append(tags, selector.String())
 	}
 
-	return strings.Join(tags, " | ")
+	selection := strings.Join(tags, " | ")
+	if s.acceptAll {
+		return selection + " - All"
+	} else {
+		return selection
+	}
 }
 
 func (s *Selection) Count() (int, error) {
 	elements, err := s.getElements()
 	if err != nil {
-		return 0, fmt.Errorf("failed to retrieve elements for '%s': %s", s, err)
+		return 0, fmt.Errorf("failed to select '%s': %s", s, err)
 	}
 
 	return len(elements), nil
@@ -153,7 +102,7 @@ func (s *Selection) Count() (int, error) {
 func (s *Selection) EqualsElement(comparable interface{}) (bool, error) {
 	element, err := s.getSelectedElement()
 	if err != nil {
-		return false, fmt.Errorf("failed to retrieve element with '%s': %s", s, err)
+		return false, fmt.Errorf("failed to select '%s': %s", s, err)
 	}
 
 	selection, ok := comparable.(*Selection)
@@ -163,7 +112,7 @@ func (s *Selection) EqualsElement(comparable interface{}) (bool, error) {
 
 	otherElement, err := selection.getSelectedElement()
 	if err != nil {
-		return false, fmt.Errorf("failed to retrieve element with '%s': %s", comparable, err)
+		return false, fmt.Errorf("failed to select '%s': %s", comparable, err)
 	}
 
 	equal, err := element.IsEqualTo(otherElement)

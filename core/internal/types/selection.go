@@ -5,7 +5,7 @@ type Selection interface {
 	FindXPath(selector string) Selection
 	FindLink(text string) Selection
 	FindByLabel(text string) Selection
-	All() MultiSelection
+	All() Selection
 	At(index int) Selection
 	String() string
 	Count() (int, error)
@@ -23,9 +23,4 @@ type Selection interface {
 	Select(text string) error
 	Submit() error
 	EqualsElement(comparable interface{}) (bool, error)
-}
-
-type MultiSelection interface {
-	String() string
-	Visible() (bool, error)
 }
